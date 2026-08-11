@@ -1,0 +1,37 @@
+# Grafana dashboard provider - Grafana 13.x format.
+# Read from $GF_PATHS_PROVISIONING/dashboards/.
+# This file only declares WHERE dashboards live; the dashboards themselves are
+# the .json files in config/grafana/dashboards/.
+apiVersion: 1
+
+providers:
+  - name: logging-stack
+    orgId: 1
+    # Created automatically if missing.
+    folder: Logs
+    folderUid: logs
+    type: file
+    # false = the repo is the source of truth, symmetric with `prune: true` on
+    # the datasource file: remove a .json from config/grafana/dashboards/ and
+    # Grafana deletes the dashboard.
+    # `true` would instead UNPROVISION it - the dashboard would survive as an
+    # ordinary, freely editable and deletable DB row the moment its JSON is not
+    # on disk (repo moved, branch switched, mount empty), which is exactly the
+    # click-ops orphan this stack forbids.
+    # UI deletion of a provisioned dashboard is independently blocked by Grafana
+    # itself, so this does not open a hole.
+    disableDeletion: false
+    # Grafana rescans this often, so editing a .json on the host shows up within
+    # 30s without restarting the container.
+    updateIntervalSeconds: 30
+    # No click-ops: UI edits cannot be saved over a provisioned dashboard.
+    # Use "Export -> Save to file" and commit the JSON instead.
+    allowUiUpdates: false
+    options:
+      # Path INSIDE the Grafana container - NOT a host path. docker-compose.yml
+      # bind-mounts ./config/grafana/dashboards here read-only, and
+      # GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH points at a file under it.
+      path: /var/lib/grafana/dashboards
+      # Must stay false while folder/folderUid are set - they are mutually
+      # exclusive. Set true (and blank folder/folderUid) to mirror subdirectories.
+      foldersFromFilesStructure: false

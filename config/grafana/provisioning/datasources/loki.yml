@@ -1,0 +1,43 @@
+# Grafana datasource provisioning - Grafana 13.x format.
+# Read from $GF_PATHS_PROVISIONING/datasources/ on every Grafana start.
+# This file is the source of truth; do not edit the datasource in the UI.
+apiVersion: 1
+
+# Makes this file authoritative: a datasource provisioned from here and later
+# removed from the file is deleted from Grafana on the next start.
+prune: true
+
+datasources:
+  - name: Loki
+    # CONTRACT: config/grafana/dashboards/*.json reference this uid directly
+    # ({"type": "loki", "uid": "loki"}). Changing it breaks every panel with
+    # "Datasource loki was not found".
+    uid: loki
+    type: loki
+    access: proxy
+    orgId: 1
+    # Compose service name on the `logging` network. Loki is not published to the
+    # host, so this URL is the only way in and only resolves from inside the
+    # network. Must match the compose service name and server.http_listen_port.
+    url: http://loki:3100
+    isDefault: true
+    # false = read-only in the UI. Change it here, not in the browser.
+    editable: false
+    jsonData:
+      # Seconds Grafana waits for a Loki response. Kept below Loki's own
+      # limits_config.query_timeout (300s) so Grafana gives up first with a clear
+      # client-side error rather than holding a connection open.
+      timeout: 60
+      # Hard cap on log lines returned to a single panel or Explore query.
+      # CONTRACT: must stay <= limits_config.max_entries_limit_per_query in
+      # config/loki/loki.yaml (currently 10000). Exceeding it makes every panel
+      # fail at once with a Loki-side "max entries limit per query exceeded".
+      maxLines: 2000
+      # No trace backend in this stack. When one exists, link log lines to traces:
+      # derivedFields:
+      #   - name: TraceID
+      #     matcherType: regex
+      #     matcherRegex: "trace_id=(\\w+)"
+      #     datasourceUid: tempo
+      #     url: "$${__value.raw}"
+      derivedFields: []

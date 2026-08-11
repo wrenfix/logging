@@ -1,0 +1,232 @@
+# =============================================================================
+# Grafana Loki 3.7.6 - single-node / monolithic
+#   mode         : target=all (single binary; includes the compactor)
+#   index        : TSDB, schema v13 (the only valid choice for a fresh 3.7.x)
+#   object store : filesystem, one named volume mounted at /loki
+#   retention    : 30 days, ACTUALLY DELETED by the compactor
+#   tenancy      : single tenant, auth_enabled=false (tenant id "fake")
+#
+# Retention is written literally below. The container does NOT run with
+# -config.expand-env, so ${...} has no special meaning in this file and a stray
+# '$' cannot turn into a boot-time "bad substitution" failure.
+# =============================================================================
+
+# 'all' wires up query-frontend, scheduler, querier, ingester, pattern-ingester,
+# distributor, ruler AND compactor in one process. The compactor being part of
+# 'all' is what makes retention work without a second container.
+target: all
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9095
+  log_level: info
+  log_format: logfmt
+  # 30-day range queries can take a while; the 30s defaults would cut them off
+  # at the HTTP layer before limits_config.query_timeout ever applied.
+  http_server_read_timeout: 600s
+  http_server_write_timeout: 600s
+  # frontend <-> scheduler <-> querier is gRPC even inside one process, and
+  # sharded responses blow past the 4MB default.
+  grpc_server_max_recv_msg_size: 104857600
+  grpc_server_max_send_msg_size: 104857600
+  grpc_server_max_concurrent_streams: 1000
+
+common:
+  # Single source of truth for on-disk layout. Everything Loki persists lives
+  # under this prefix, so exactly one volume needs mounting at /loki.
+  path_prefix: /loki
+  instance_addr: 127.0.0.1
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+
+# -----------------------------------------------------------------------------
+# Schema. tsdb + v13 is mandatory: structured metadata is on by default in 3.x
+# and Loki refuses to start on an older schema. index.period MUST be 24h -
+# retention drops/rewrites whole index tables.
+# 'from' is a fixed past date. NEVER change it on a live deployment; schema
+# changes are made by APPENDING a new entry with a future 'from'.
+# -----------------------------------------------------------------------------
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  filesystem:
+    # The object-store ROOT, not just "where chunks go". Loki writes:
+    #   /loki/chunks/fake/...                  chunks
+    #   /loki/chunks/index/index_<n>/...       shipped TSDB index
+    #   /loki/chunks/index/delete_requests/... compactor delete requests
+    # This explicit value WINS over common.storage.filesystem.chunks_directory
+    # (the config file is re-parsed on top of the derived config). Keep both in
+    # sync, or change this one.
+    directory: /loki/chunks
+  tsdb_shipper:
+    active_index_directory: /loki/tsdb-shipper-active
+    cache_location: /loki/tsdb-shipper-cache
+    cache_ttl: 24h
+
+# -----------------------------------------------------------------------------
+# Compactor - the ONLY component that deletes expired data.
+#   retention_enabled false/omitted -> compacts forever, deletes nothing, silently
+#   delete_request_store omitted     -> hard startup failure (the good kind)
+#   working_directory ephemeral      -> retention markers lost on restart, and the
+#                                       chunks they referenced are never unlinked
+# -----------------------------------------------------------------------------
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+  compaction_interval: 10m
+  # Pinned explicitly. Left at 0s, Loki sets it to compaction_interval and then
+  # ADDS jitter of min(10m, interval/2), so the effective value would be 15m and
+  # would not match this file. 20m is an exact multiple and no jitter is applied.
+  apply_retention_interval: 20m
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 150
+
+limits_config:
+  # ---- retention ------------------------------------------------------------
+  # 30 days. Inert unless compactor.retention_enabled is true (it is).
+  retention_period: 720h
+
+  # ---- ingestion ------------------------------------------------------------
+  # Sized against what this host can STORE, not what the socket can carry:
+  # 738GB free / 30d ~= 24GB/day on disk; at snappy's ~5-8x on container logs
+  # that is roughly 4-8 MB/s of raw log sustained. Retention frees nothing at
+  # all during the first 30 days, so these are the only real backstop.
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+  # Per-stream (= per container/stream) ceiling, deliberately far below the
+  # global one so a single chatty container cannot consume the whole budget and
+  # 429 every other container off the host.
+  per_stream_rate_limit: 4MB
+  per_stream_rate_limit_burst: 8MB
+  max_streams_per_user: 0
+  # Realistic load here is ~2 streams per container (stdout/stderr), i.e. low
+  # hundreds. 1000 leaves ~5-10x headroom while still firing as a clean 429
+  # (loki_discarded_samples_total{reason="streams_limit"}) long before the
+  # ingester's per-stream head chunks can OOM the container.
+  max_global_streams_per_user: 1000
+  # Covers job/container/compose_project/compose_service/service_name/stream
+  # plus Loki's own service_name/detected_level with slack.
+  max_label_names_per_series: 20
+  max_line_size: 256KB
+  # Truncate an over-long line instead of rejecting the whole push batch.
+  max_line_size_truncate: true
+  # Docker frequently emits several lines with an identical timestamp; bump
+  # duplicates by 1ns rather than losing them to out-of-order rejection.
+  increment_duplicate_timestamp: true
+  # The acceptance window MUST match the retention window, or the stack silently
+  # refuses to store data it is configured to keep. Alloy additionally drops
+  # anything older than 24h before it is shipped (config.alloy stage.drop), so
+  # in practice nothing here is ever rejected as too old.
+  reject_old_samples: true
+  reject_old_samples_max_age: 720h
+  creation_grace_period: 10m
+
+  # ---- structured metadata --------------------------------------------------
+  # Required by config.alloy, which carries container_id and image as structured
+  # metadata (per-entry, inside the chunk) instead of as index labels.
+  allow_structured_metadata: true
+  max_structured_metadata_size: 64KB
+  max_structured_metadata_entries_count: 128
+
+  # ---- query behaviour ------------------------------------------------------
+  # query_timeout moved here from `querier` and split_queries_by_interval from
+  # `query_range` in Loki 3.0. Setting them in the old places is a startup error.
+  query_timeout: 300s
+  # Loki's own default. 15m is a Helm value for a horizontally scaled read path;
+  # with ONE querier it just quadruples subrequest count (2880 vs 720 for a
+  # 30-day range) through the same 16 execution slots.
+  split_queries_by_interval: 1h
+  # Trim (not reject) requests that reach past the retention window.
+  max_query_lookback: 720h
+  max_query_length: 721h
+  # CONTRACT: must stay >= jsonData.maxLines in
+  # config/grafana/provisioning/datasources/loki.yml (currently 2000).
+  max_entries_limit_per_query: 10000
+  max_query_series: 5000
+  max_cache_freshness_per_query: 10m
+  # Powers the log-volume histogram in Explore / Logs Drilldown.
+  volume_enabled: true
+
+ingester:
+  chunk_idle_period: 30m
+  chunk_target_size: 1572864
+  # snappy trades ~2x on-disk size for markedly lower query latency. With 738GB
+  # free that is the right side of the trade; switch to gzip if disk gets tight.
+  chunk_encoding: snappy
+  max_chunk_age: 2h
+  wal:
+    enabled: true
+    # The default is the RELATIVE path "wal", which would land in the container's
+    # working directory and be lost on recreate. Pin it onto the volume.
+    dir: /loki/wal
+    # Default is FALSE: without this, SIGTERM does not flush and recovery depends
+    # entirely on WAL replay - which also makes the compose stop_grace_period
+    # pointless. With it true, a normal restart starts from flushed chunks.
+    flush_on_shutdown: true
+    # Default is 4GB, which exceeds this container's GOMEMLIMIT of 3600MiB and
+    # would let replay OOM-kill Loki on the first unclean restart.
+    replay_memory_ceiling: 2GB
+
+# Log pattern detection (the Patterns tab / Logs Drilldown).
+# metric_aggregation.loki_address is left empty and the corresponding
+# limits_config flags stay at their false defaults, so Loki never pushes derived
+# streams back into itself.
+pattern_ingester:
+  enabled: true
+
+querier:
+  # 16 cores on this host. The frontend worker inherits this value automatically,
+  # and it is the real parallelism ceiling for split queries.
+  max_concurrent: 16
+
+query_range:
+  align_queries_with_step: true
+  cache_results: true
+  results_cache:
+    cache:
+      # In-process heap cache; no Redis/Memcached container needed.
+      # IMPORTANT: cache_index_stats_results, cache_volume_results,
+      # cache_series_results and cache_label_results all default to TRUE, and each
+      # CLONES this block into its own independent embedded cache. The real
+      # ceiling is therefore 5 x max_size_mb, i.e. ~640MB here - not 128MB.
+      embedded_cache:
+        enabled: true
+        max_size_mb: 128
+        ttl: 1h
+
+# chunk_store_config.chunk_cache_config is deliberately NOT set. The "object
+# store" is a local directory on this host, so chunk bytes are already served
+# from the kernel page cache for free, outside the Go heap and without GC
+# pressure. An embedded chunk cache would just keep a second, GC-managed copy.
+
+frontend:
+  # What the upstream image's own config uses; cheaper than json for
+  # frontend <-> querier round trips.
+  encoding: protobuf
+  compress_responses: true
+  log_queries_longer_than: 20s
+  # NOTE: max_outstanding_per_tenant is intentionally absent. With no
+  # frontend_address/scheduler_address, Loki auto-enables the scheduler ring and
+  # builds a v2 frontend; that key belongs to the v1 frontend and is never read.
+  # The queue that actually applies is
+  # query_scheduler.max_outstanding_requests_per_tenant (default 32000).
+
+# Silence the anonymous usage report to stats.grafana.org (ON by default in 3.7.x).
+analytics:
+  reporting_enabled: false

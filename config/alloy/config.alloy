@@ -1,0 +1,443 @@
+// ============================================================================
+//  config/alloy/config.alloy
+//  Grafana Alloy v1.18.1 - collect logs from ALL Docker containers on the host
+// ============================================================================
+//
+//  PIPELINE
+//    discovery.docker    -> polls the Docker API for running containers
+//    discovery.relabel   -> (a) filters which containers get a tailer
+//                           (b) exports the rules that build the final labels
+//    loki.source.docker  -> one tailer per container, applies (b) per entry
+//    loki.process        -> age guard, rate guard, structured metadata,
+//                           hard label allow-list
+//    loki.write          -> pushes to http://loki:3100 on the compose network
+//
+//  CONTRACT WITH docker-compose.yml (this file does not work without it):
+//    1. /var/run/docker.sock mounted into the alloy container.
+//    2. --storage.path=/var/lib/alloy/data backed by the `alloy-data` volume.
+//       Positions live at
+//         /var/lib/alloy/data/loki.source.docker.containers/positions.yml
+//       If that path is not persisted, every ALLOY restart re-reads each
+//       container from the beginning.
+//       CAVEAT: this does NOT cover CONTAINER restarts. When a container stops,
+//       its discovery target disappears, the tailer stops and DELETES its
+//       positions entry. A `docker restart` therefore re-reads that container's
+//       whole retained log. Bounded by the 24h age drop below and by daemon-level
+//       json-file rotation (item 6).
+//    3. Alloy needs read access to the socket - it runs as root in the image.
+//       Socket access is root-equivalent on the host; `:ro` is NOT a boundary.
+//    4. --server.http.listen-addr=0.0.0.0:12345 inside the container, published
+//       as ports: ["127.0.0.1:12345:12345"]. The UI is UNAUTHENTICATED and
+//       renders every argument value, so loopback only.
+//    5. Loki must resolve as `loki` on port 3100 on the compose network.
+//    6. The host daemon MUST set json-file rotation in /etc/docker/daemon.json
+//       (max-size 50m / max-file 3, then `sudo systemctl restart docker`).
+//       Loki's 30d retention does NOT bound /var/lib/docker/containers/*/*.log:
+//       Alloy reads through the API and never truncates it. Without rotation the
+//       host disk fills and takes the Docker daemon - and this whole stack -
+//       down with it. Corollary: 150MB/container is Alloy's catch-up budget if
+//       it stalls; data rotated away before Alloy reads it is lost.
+//
+//  KNOWN GAPS (no config closes these - verify coverage after deploy):
+//    * Discovery is a POLL, not an event stream. A container whose entire
+//      lifetime is shorter than refresh_interval is NEVER discovered and its
+//      logs are lost silently: `docker compose run --rm` one-offs, init/migration
+//      jobs, and crash-looping containers that exit in under 2s.
+//    * A container with NO attached network (network_mode: none, or an
+//      unresolvable network_mode:container:<id>) produces zero discovery targets
+//      and is silently never tailed. Isolate with an `internal: true` network
+//      instead of network_mode: none.
+//    * Only json-file, local and journald log drivers are natively readable
+//      through the API. Others work only via Docker's dual-logging cache, and
+//      `logging: {driver: none}` makes a container permanently invisible AND
+//      produces a "could not fetch logs" error on every discovery tick. Never
+//      set driver: none on this host; label such containers logging.exclude=true.
+//    Verify actual coverage:
+//      docker ps --format '{{.Names}}' | sort
+//      vs. `count by (container) (count_over_time({job="docker"}[1h]))` in Grafana
+// ============================================================================
+
+
+// ---------------------------------------------------------------------------
+// Alloy's own logging. `write_to` is deliberately NOT set: piping Alloy's
+// internal logs into this same pipeline is the classic amplification loop
+// (Loki down -> loki.write logs a retry error -> that error is ingested ->
+// more backlog -> more errors). Reach them via `docker logs logging-alloy` or
+// the UI on 127.0.0.1:12345.
+// ---------------------------------------------------------------------------
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+
+// ---------------------------------------------------------------------------
+// 1. DISCOVERY - every running container, refreshed on a timer.
+//
+// This POLLS GET /containers/json (plus a network list) every refresh_interval;
+// there is no Docker event stream anywhere in this path. Each poll re-exports
+// .targets and Alloy's graph starts a tailer for each newly-seen container ID
+// and stops the tailer for any that disappeared. So a container started at T is
+// tailed by roughly T+2s with no config edit and no Alloy restart.
+//
+// 2s halves the total-loss window for short-lived containers versus the 5s that
+// Grafana's own Docker integration ships, at a cost of one container-list plus
+// one network-list API call every 2s - noise on a 16-core host. It cannot be
+// closed at any value; see KNOWN GAPS above. Raise to 15-30s only if you ever
+// run hundreds of containers.
+//
+// Docker's default filter lists RUNNING containers only, which is what we want.
+// ---------------------------------------------------------------------------
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "2s"
+}
+
+
+// ---------------------------------------------------------------------------
+// 2a. TARGET FILTERING - decide WHICH containers get a tailer.
+//
+// Runs at discovery time; a dropped target never gets a tailer at all, which is
+// strictly cheaper than filtering log lines later. `drop` only removes targets -
+// every __meta_docker_* label (including the container ID the tailer needs)
+// survives untouched into .output.
+//
+// Default policy is ALL containers. These are the only exclusions.
+// ---------------------------------------------------------------------------
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  // Generic opt-out. Any container labelled logging.exclude=true is skipped.
+  // Docker label dots are sanitised to underscores in the meta-label name.
+  // Carried by all three stack containers in docker-compose.yml (alloy, loki and
+  // grafana); also the escape hatch for a container using a log driver the API
+  // cannot read back, or one so chatty it is not worth indexing.
+  rule {
+    source_labels = ["__meta_docker_container_label_logging_exclude"]
+    regex         = "true"
+    action        = "drop"
+  }
+
+  // Belt and braces for THIS stack's own alloy and loki containers, in case the
+  // label above is ever dropped from the compose file. Grafana is deliberately
+  // NOT in this rule: it is excluded for noise, not safety, so losing its label
+  // costs you a chattier index - not a feedback loop - and a second mechanism
+  // would only make that preference harder to reverse.
+  //   * alloy: tailing itself feeds its own retry errors back into itself.
+  //   * loki:  every ingestion rejection (429 rate limit, 400 too-old, disk
+  //            full) writes an error line to Loki's stdout. Shipping that line
+  //            back into Loki produces another rejection and another line - a
+  //            loop that engages exactly when Loki is already degraded.
+  // Matched on project AND service (joined by "/") so a container named "loki"
+  // in somebody else's compose stack is still collected normally.
+  rule {
+    source_labels = [
+      "__meta_docker_container_label_com_docker_compose_project",
+      "__meta_docker_container_label_com_docker_compose_service",
+    ]
+    separator = "/"
+    regex     = "logging/(alloy|loki)"
+    action    = "drop"
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// 2b. LABEL CONSTRUCTION - exported purely for its `.rules`.
+//
+// `targets = []` is the documented idiom: this component relabels nothing, it
+// exists so loki.source.docker can borrow its rule list.
+//
+// The rules must live HERE and not in the block above because
+// __meta_docker_container_log_stream does not exist at discovery time - the
+// tailer sets it per log entry, immediately before these rules run.
+//
+// Order inside the tailer: target labels (all __meta_*) -> set
+// __meta_docker_container_log_stream -> apply these rules -> DROP every label
+// whose name starts with "__". So __meta_* can never leak into Loki.
+//
+// Regexes are fully anchored by the relabeller (^(?:...)$). A rule whose regex
+// does not match is a no-op, which is what makes the `(.+)` fallback chains
+// below work: they simply do nothing for containers that lack the source label.
+//
+// CONTRACT: this label set is what config/grafana/dashboards/container-logs.json
+// queries. Change one, change the other.
+// ---------------------------------------------------------------------------
+discovery.relabel "container_labels" {
+  targets = []
+
+  // --- job ----------------------------------------------------------------
+  // Constant, so zero cardinality, and a single cheap entry point for
+  // "show me everything": {job="docker"}.
+  rule {
+    target_label = "job"
+    replacement  = "docker"
+  }
+
+  // --- container ----------------------------------------------------------
+  // The primary identity label. Docker reports names with a leading slash
+  // ("/logging-loki"); the capture group strips it. `/?` makes the rule
+  // idempotent. One value per container on the host - this is the finest-grained
+  // label kept and therefore the one that sets the stream count.
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/?(.*)"
+    target_label  = "container"
+  }
+
+  // --- compose_project ----------------------------------------------------
+  // Set only for compose-managed containers. `(.+)` does not match the empty
+  // string, so plain `docker run` containers get no label rather than an empty
+  // one. (The dashboard's variables use allValue ".*" precisely so that streams
+  // WITHOUT this label are still matched by "All".)
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = "(.+)"
+    target_label  = "compose_project"
+  }
+
+  // --- compose_service ----------------------------------------------------
+  // Coarser than `container` (all replicas share it) and a pure function of the
+  // container, so it adds no streams - only a few bytes per existing stream.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = "(.+)"
+    target_label  = "compose_service"
+  }
+
+  // --- service_name -------------------------------------------------------
+  // Loki 3.x stamps service_name="unknown_service" on any stream lacking a
+  // recognised service label, and Grafana Logs Drilldown keys off it. Two rules
+  // form a fallback chain: rule 1 always sets the container name, rule 2
+  // overwrites with the compose service when one exists. Pure function of labels
+  // already kept => zero extra streams.
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/?(.*)"
+    target_label  = "service_name"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = "(.+)"
+    target_label  = "service_name"
+  }
+
+  // --- stream -------------------------------------------------------------
+  // Exactly two values. Doubles the stream count in the worst case (50
+  // containers -> 100 streams), which is trivial, and "only stderr" is a
+  // first-class query.
+  rule {
+    source_labels = ["__meta_docker_container_log_stream"]
+    regex         = "(.+)"
+    target_label  = "stream"
+  }
+
+  // --- container_id (TEMPORARY - becomes structured metadata) --------------
+  // Truncated to the 12 chars `docker ps` shows. Created as a label ONLY so
+  // loki.process can read it out of the extracted map; stage.label_keep below
+  // strips it from the index. It must never reach Loki as a label - it changes
+  // on every container recreation and would orphan a stream on every deploy.
+  // Why it earns its place: after a recreate, `container` and `compose_service`
+  // are identical across old and new; the short ID is the only thing that says
+  // which incarnation produced a line.
+  rule {
+    source_labels = ["__meta_docker_container_id"]
+    regex         = "(.{12}).*"
+    target_label  = "container_id"
+  }
+
+  // --- image (TEMPORARY - becomes structured metadata) ---------------------
+  // BEST EFFORT, AND KNOWN INCOMPLETE. Alloy's Docker discovery delegates to
+  // Prometheus's moby SD, whose common labels are exactly container id, name and
+  // network_mode plus the sanitised container labels - there is no
+  // __meta_docker_container_image, so the image cannot be read directly.
+  //
+  // Fallback chain, worst source first (later rules overwrite earlier ones):
+  //   1. com.docker.compose.image  - stamped by Compose on every container it
+  //      creates, but it is an image DIGEST (sha256:...), not a readable tag.
+  //   2/3. OCI image labels, which Docker copies from the image onto the
+  //      container. Many images set them; many do not.
+  //   4. logging.image - stamp it yourself on containers you control:
+  //        labels: ["logging.image=myrepo/myapp:1.2.3"]
+  //
+  // Carried as STRUCTURED METADATA, never as an index label: an image tag
+  // changes on every deploy, so an `image` LABEL would mint a brand-new stream
+  // per container per release.
+  // RESIDUAL GAP: a plain `docker run` container from an image with no OCI
+  // labels and no logging.image label gets no image value at all.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_image"]
+    regex         = "(.+)"
+    target_label  = "image"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_org_opencontainers_image_version"]
+    regex         = "(.+)"
+    target_label  = "image"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_org_opencontainers_image_ref_name"]
+    regex         = "(.+)"
+    target_label  = "image"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_logging_image"]
+    regex         = "(.+)"
+    target_label  = "image"
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// 3. TAILING - one reader per discovered container.
+//
+// Reads via the Docker API, so the entry timestamp comes from Docker rather
+// than being guessed from the line. REQUIRES a readable log driver - see the
+// KNOWN GAPS block at the top of this file.
+//
+// Read offsets are checkpointed to positions.yml under this component's data
+// directory, so a restart resumes each container NEAR where it left off.
+// Offsets are stored at SECOND granularity and Docker's `since` is inclusive of
+// that whole second, so an Alloy restart replays up to one second of
+// already-ingested lines per container. Expect a small, bounded number of
+// duplicates around every restart; this is not a bug to chase.
+//
+// FIRST BOOT / DELETED alloy-data VOLUME: positions.yml is empty, the API is
+// called with since=0 (which is "no time filter", not "tail from now"), and
+// every running container's FULL retained history is replayed with its ORIGINAL
+// timestamps. loki.source.docker has no tail-from-end option. The stage.drop
+// age guard below is what bounds that burst.
+//
+// `refresh_interval` is left at its default here: it only sets the HTTP client
+// timeout when the daemon is reached over http/https and is unused for a unix
+// socket. New-container pickup is governed solely by discovery.docker above.
+// ---------------------------------------------------------------------------
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.relabel.containers.output
+  relabel_rules = discovery.relabel.container_labels.rules
+  forward_to    = [loki.process.containers.receiver]
+}
+
+
+// ---------------------------------------------------------------------------
+// 4. PROCESSING - age guard, rate guard, structured metadata, cardinality guard.
+//
+// loki.process seeds its extracted-data map with the entry's labels before any
+// stage runs, which is what lets container_id and image cross from label ->
+// structured metadata here.
+//
+// Drop criteria INSIDE a single stage.drop block are ANDed, so each independent
+// reason needs its own block.
+// ---------------------------------------------------------------------------
+loki.process "containers" {
+  forward_to = [loki.write.local.receiver]
+
+  // Bounds the first-boot backfill and the re-read after any `docker restart`.
+  // Without it, a clean rebuild replays months of history from every running
+  // container in one burst. 24h is deliberately far below Loki's
+  // reject_old_samples_max_age (720h), so nothing Alloy ships is ever rejected
+  // as too old - widen this if you genuinely want more history back-filled.
+  stage.drop {
+    older_than          = "24h"
+    drop_counter_reason = "older_than_24h"
+  }
+
+  // Blank lines carry no information and are common padding in container output.
+  stage.drop {
+    expression          = `^\s*$`
+    drop_counter_reason = "empty_line"
+  }
+
+  // Per-container token bucket. loki.process -> loki.write is a SINGLE shared
+  // pipeline: without this, one container in a crash-restart loop dumping stack
+  // traces backpressures and starves every other container's logs - a total
+  // observability outage caused by one noisy neighbour, at exactly the moment
+  // you need everyone else's logs. by_label_name REQUIRES drop = true, which is
+  // the point: shed the offender's excess instead of blocking the pipeline.
+  // Watch loki_process_dropped_lines_total{reason="rate_limit"}.
+  // max_distinct_labels: Alloy silently clamps anything below 10000 up to 10000
+  // and logs "max_distinct_labels was adjusted up to the minimal reasonable
+  // value" on every start. Written at the effective value so the file matches
+  // what actually runs. It caps how many per-container buckets are tracked; far
+  // above any realistic container count on this host.
+  stage.limit {
+    rate                = 1000
+    burst               = 5000
+    by_label_name       = "container"
+    drop                = true
+    max_distinct_labels = 10000
+  }
+
+  // Stored per entry inside the chunk, never in the stream index, so these cost
+  // no cardinality while remaining filterable:
+  //   {job="docker"} | container_id="a1b2c3d4e5f6"
+  // An empty value means "use the extracted key with the same name".
+  stage.structured_metadata {
+    values = {
+      container_id = "",
+      image        = "",
+    }
+  }
+
+  // The cardinality backstop. Anything not on this list - including the
+  // container_id and image labels consumed above, and anything a future edit
+  // might accidentally introduce - is removed before it can reach the index.
+  //
+  // Final index label set, and nothing else, ever. Must match the label names
+  // used by config/grafana/dashboards/container-logs.json.
+  stage.label_keep {
+    values = [
+      "job",
+      "container",
+      "compose_project",
+      "compose_service",
+      "service_name",
+      "stream",
+    ]
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// 5. WRITE - to Loki over the compose network.
+//
+// `loki` is the compose service name; Docker's embedded DNS resolves it on the
+// `logging` network. No tenant_id: Loki runs single-tenant with
+// auth_enabled=false and assigns the "fake" tenant itself.
+//
+// DURABILITY: loki.write also has a `wal` block that would persist entries to
+// disk before pushing. It is NOT enabled here because it is an EXPERIMENTAL
+// feature that requires running the whole process with
+// --stability.level=experimental. Instead the retry budget below is widened.
+// Consequence, stated plainly: a Loki outage longer than roughly one hour
+// discards the in-flight batch PERMANENTLY (the tailer has already advanced its
+// position, so those lines are never re-read). Alert on
+// loki_write_dropped_entries_total. To opt into the WAL instead, add
+// --stability.level=experimental to the alloy command in docker-compose.yml and
+// a `wal { enabled = true, max_segment_age = "1h" }` block here, and raise the
+// alloy stop_grace_period above the 30s default drain_timeout.
+// ---------------------------------------------------------------------------
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+
+    // Batching. Stated explicitly because these are the knobs you reach for
+    // first if ingest ever falls behind.
+    batch_wait     = "1s"
+    batch_size     = "1MiB"
+    remote_timeout = "10s"
+
+    // Retry budget, stated explicitly. The defaults (10 retries, 500ms -> 5m)
+    // give only ~8.5 MINUTES before the in-flight batch is dropped for good.
+    // 20 retries extends that to roughly an hour, which covers a slow Loki
+    // restart, a long compaction pass or an OOM-kill loop. Raising this is cheap
+    // because the client stops draining its input while retrying, so unread data
+    // stays in Docker's json files rather than in Alloy's memory - provided
+    // those files are rotation-bounded but not tiny (50m x 3, see contract 6).
+    // 4xx responses are NOT retried at any setting.
+    min_backoff_period  = "500ms"
+    max_backoff_period  = "5m"
+    max_backoff_retries = 20
+  }
+}

@@ -1,0 +1,227 @@
+# Docker container logging stack: Alloy (collect) -> Loki (store) -> Grafana (read).
+# Compose Specification; the obsolete top-level `version:` key is intentionally absent.
+# Pinned images - do not float these tags.
+name: logging
+
+# Rotation for THESE THREE containers only. Host-wide rotation must be set in
+# /etc/docker/daemon.json - see README "Host-wide log rotation".
+x-logging: &container-log-rotation
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+  # ---------------------------------------------------------------------------
+  # Loki - log store. Never published to the host; reachable only as
+  # http://loki:3100 on the `logging` bridge network (it has no authentication).
+  # ---------------------------------------------------------------------------
+  loki:
+    image: grafana/loki:3.7.6
+    container_name: logging-loki
+    hostname: loki
+    restart: unless-stopped
+    # Matches the image: `COPY --chown=10001:10001 /loki /loki` + `USER 10001`.
+    user: "10001:10001"
+    command:
+      - -config.file=/etc/loki/loki.yaml
+    environment:
+      TZ: ${TZ:-UTC}
+      # Go does NOT read cgroup memory limits (unlike GOMAXPROCS since Go 1.25).
+      # Without this the GC never backs off and the kernel OOM-kills Loki
+      # mid-flush instead. ~90% of mem_limit.
+      GOMEMLIMIT: 3600MiB
+    volumes:
+      - ./config/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    expose:
+      - "3100"
+    networks:
+      - logging
+    labels:
+      # Loki must not collect its own logs. Every ingestion rejection (rate limit,
+      # stream limit, disk full) writes an error line to Loki's stdout; collecting
+      # it would push that line back into Loki, causing another rejection. That
+      # feedback loop engages exactly when Loki is already degraded.
+      # Read them with: docker compose logs -f loki
+      logging.exclude: "true"
+    # grafana/loki:3.7.6 is a Bazel-built distroless Debian 13 image: no shell,
+    # no curl, no wget, only /usr/bin/loki. A container healthcheck has nothing
+    # to execute, so it is disabled deliberately rather than forgotten.
+    # Readiness is checked from the Grafana container, which does ship curl:
+    #   docker compose exec -T grafana curl -fsS http://loki:3100/ready
+    healthcheck:
+      disable: true
+    # ingester.wal.flush_on_shutdown=true is set in loki.yaml, so SIGTERM really
+    # does flush head chunks. This grace period is what gives it time.
+    stop_grace_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    cpus: 4.0
+    mem_limit: 4g
+    # This host has 8 GiB of swap on cgroup v2. Without memswap_limit == mem_limit
+    # the container spills into swap instead of being OOM-killed, and a runaway
+    # query thrashes the whole host instead of crash-restarting.
+    memswap_limit: 4g
+    mem_reservation: 512m
+    logging: *container-log-rotation
+
+  # ---------------------------------------------------------------------------
+  # Alloy - discovers every container over the Docker API and tails its logs.
+  # New containers are picked up automatically; no config edit is ever required.
+  # ---------------------------------------------------------------------------
+  alloy:
+    image: grafana/alloy:v1.18.1
+    container_name: logging-alloy
+    hostname: alloy
+    restart: unless-stopped
+    command:
+      - run
+      # Bind inside the container; the `ports:` entry below decides who can reach it.
+      # The default 127.0.0.1:12345 would make the UI and healthcheck unreachable.
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - --disable-reporting
+      - /etc/alloy/config.alloy
+    environment:
+      TZ: ${TZ:-UTC}
+      GOMEMLIMIT: 900MiB
+    volumes:
+      - ./config/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      # Read positions. Must survive restarts or Alloy re-reads from the beginning.
+      - alloy-data:/var/lib/alloy/data
+      # SECURITY: the Docker API socket is root-equivalent on this host. `:ro` only
+      # makes the socket FILE read-only - it does NOT filter the API, so anything
+      # that can talk to it can create a privileged container and own the host.
+      # See README "Docker socket exposure" for the filtering-proxy overlay.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      # Alloy's debug UI has NO authentication and renders the full config graph.
+      # Loopback only.
+      - "${ALLOY_UI_BIND_IP:-127.0.0.1}:${ALLOY_UI_PORT:-12345}:12345"
+    labels:
+      # Alloy must not collect its own logs: a failed push logs an error, which
+      # would be collected, pushed, fail again. config.alloy drops targets carrying
+      # this label, which also gives any other container a zero-config opt-out.
+      logging.exclude: "true"
+    depends_on:
+      loki:
+        # Not service_healthy: Loki is distroless and cannot expose a healthcheck.
+        # Start order only. Durability across a Loki outage comes from loki.write's
+        # retry budget (~1h, configured in config.alloy), NOT from a WAL - the
+        # loki.write `wal` block is experimental and is deliberately not enabled.
+        condition: service_started
+    healthcheck:
+      # /-/healthy enumerates every component and returns 500 naming any that are
+      # unhealthy. /-/ready only reports that the initial config load finished, so
+      # it stays 200 even when loki.write is failing every push and nothing ships.
+      # The Alloy image is Ubuntu-based and ships neither curl nor wget, but bash
+      # has /dev/tcp compiled in.
+      test:
+        - CMD
+        - /usr/bin/bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/12345; printf "GET /-/healthy HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3; head -n 1 <&3 | grep -q " 200 "'
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+      start_interval: 2s
+    networks:
+      - logging
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cpus: 2.0
+    mem_limit: 1g
+    memswap_limit: 1g
+    mem_reservation: 128m
+    logging: *container-log-rotation
+
+  # ---------------------------------------------------------------------------
+  # Grafana - the only service a human talks to. Datasource and dashboards are
+  # provisioned from files; nothing is clicked into place.
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:13.1.3
+    container_name: logging-grafana
+    hostname: grafana
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-UTC}
+      GOMEMLIMIT: 900MiB
+      # Compose fails fast with this message if .env lacks the password.
+      # NOTE: Grafana applies this ONLY when it creates the admin user, i.e. on a
+      # fresh grafana-data volume. See README "First run" step 0.
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env (copy .env.example)}
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:24680}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_DEFAULT_THEME: dark
+      # Quiet, offline-friendly startup.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_LOG_MODE: console
+      GF_LOG_LEVEL: ${GRAFANA_LOG_LEVEL:-info}
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+      # Server-side floor. Stops anyone pointing a 10s auto-refresh at a 30-day
+      # range and pinning the single-binary Loki forever.
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: "1m"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/container-logs.json
+    labels:
+      # Grafana is excluded for NOISE, not for safety. Unlike loki and alloy it sits
+      # off the push path and cannot feed a line back into itself, so there is no
+      # amplification risk here - but every panel refresh writes several
+      # `logger=tsdb.loki endpoint=queryData` lines, and with a 1m auto-refresh
+      # Grafana talking about querying Loki drowns out the containers you actually
+      # care about. Consequence: Grafana's own logs are no longer searchable in
+      # Grafana. Read them with: docker compose logs -f grafana
+      # Drop this line to put them back; nothing else has to change.
+      logging.exclude: "true"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      # Mount the two provisioning subdirectories we own, NOT the parent. Mounting
+      # the parent hides the image's own plugins/ and alerting/ directories and
+      # Grafana then logs ERROR lines on every boot.
+      - ./config/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./config/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      # Must equal providers[0].options.path in dashboards.yml.
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      # Left side = host. Right side = inside the container, where Grafana always
+      # listens on 3000; that one is namespaced and never collides with the host.
+      - "${GRAFANA_BIND_IP:-127.0.0.1}:${GRAFANA_PORT:-24680}:3000"
+    depends_on:
+      loki:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-m", "5", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+      start_interval: 2s
+    networks:
+      - logging
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cpus: 2.0
+    mem_limit: 1g
+    memswap_limit: 1g
+    mem_reservation: 128m
+    logging: *container-log-rotation
+
+networks:
+  logging:
+    name: logging
+    driver: bridge
+
+volumes:
+  loki-data:
+  alloy-data:
+  grafana-data:

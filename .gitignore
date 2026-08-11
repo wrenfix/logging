@@ -1,0 +1,8 @@
+# Local secrets - contains GRAFANA_ADMIN_PASSWORD. Never commit.
+.env
+
+# Backup artifacts produced by the README's backup command
+grafana-data.tgz
+
+# Playwright MCP debugging artifacts (page snapshots, console logs)
+.playwright-mcp/
